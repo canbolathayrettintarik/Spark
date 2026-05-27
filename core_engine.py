@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Crimson Core Engine v2.0
+CrimsonWeb Core Engine v2.1
 Authorized adversary-emulation web/service scanner.
 USE ONLY against targets covered by a signed, written Rules of
-Engagement (RoE). The --roe-confirmed flag is REQUIRED at every
+Engagement (RoE). The --roe flag is REQUIRED at every
 invocation and its value is logged to the audit trail.
 What this engine does:
   - Resolves IPv4 and IPv6 targets.
@@ -38,6 +38,7 @@ import ipaddress
 import json
 import logging
 import os
+import queue
 import random
 import re
 import socket
@@ -47,14 +48,14 @@ import sys
 import tempfile
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from importlib.util import find_spec
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit, urlunsplit
 # --------------------------------------------------------------------------
 # Optional dependencies — gracefully degraded
@@ -109,28 +110,37 @@ except ImportError:
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
-APP_NAME = "Crimson"
-APP_VERSION = "2.0.0"
-REPORT_PREFIX = "crimson"
-LOG_FILE_TEXT = "crimson_audit.log"
-LOG_FILE_JSONL = "crimson_audit.jsonl"
+APP_NAME = "CrimsonWeb"
+APP_VERSION = "2.1.0"
+REPORT_PREFIX = "crimsonweb"
+LOG_FILE_TEXT = "crimsonweb_audit.log"
+LOG_FILE_JSONL = "crimsonweb_audit.jsonl"
 LOG_MAX_BYTES = 2_000_000
 LOG_BACKUP_COUNT = 5
+PRIVATE_LOG_MODE = 0o600
+SENSITIVE_CLI_OPTIONS = {
+    "--tor-control-password",
+    "--nvd-api-key",
+}
 DEFAULT_CONNECT_TIMEOUT = 1.5
 DEFAULT_BANNER_TIMEOUT = 3.0
 DEFAULT_PORT_CONCURRENCY = 500
 DEFAULT_SERVICE_CONCURRENCY = 50
 DEFAULT_UDP_TIMEOUT = 2.0
+DEFAULT_TOP_PORTS_COUNT = 1000
 MAX_HTTP_READ_BYTES = 8192
 MAX_BANNER_READ_BYTES = 1024
 MIN_PRINTABLE_RATIO = 0.7
 TCP_SYN_ACK_FLAGS = 0x12
 MAX_CVE_DESCRIPTION_LENGTH = 500
 MAX_CVE_RESULTS_PER_QUERY = 3
+MAX_CVE_CACHE_ENTRIES = 500
 NVD_FREE_RATE_LIMIT = 90
 NVD_API_KEY_RATE_LIMIT = 2000
 NVD_RATE_PERIOD_SECONDS = 300
-UDP_SCAN_PORTS = (53, 161, 1900)
+UDP_SYSLOG_PORT = 514
+UDP_SCAN_PORTS = (53, 69, 123, 161, 500, 1900, 5353)
+UDP_OPTIONAL_PORTS = (UDP_SYSLOG_PORT,)
 DEFAULT_WEB_REQUEST_DELAY = 3.0
 DEFAULT_WEB_SENSITIVE_DELAY = 5.0
 DEFAULT_WEB_MAX_GLOBAL_RATE = 20
@@ -141,11 +151,24 @@ DEFAULT_TOR_CONTROL_PORT = 9051
 DEFAULT_TOR_NEW_IDENTITY_WAIT = 10.0
 HTTP_PROXY_SCHEMES = frozenset({"http", "https"})
 SOCKS_PROXY_SCHEMES = frozenset({"socks4", "socks4a", "socks5", "socks5h"})
+REMOTE_DNS_SOCKS_SCHEMES = frozenset({"socks4a", "socks5h"})
 SUPPORTED_PROXY_SCHEMES = HTTP_PROXY_SCHEMES | SOCKS_PROXY_SCHEMES
 DEFAULT_BAN_COOLDOWN_SECONDS = 900
 DEFAULT_BAN_SOFT_THRESHOLD = 3
 DEFAULT_BAN_COOLDOWN_MULTIPLIER = 2.0
 DEFAULT_BAN_COOLDOWN_MAX = 7200
+HTTP_SECURITY_HEADERS = (
+    "strict-transport-security",
+    "content-security-policy",
+    "x-frame-options",
+    "x-content-type-options",
+    "referrer-policy",
+    "permissions-policy",
+)
+CORS_TEST_ORIGIN = "https://crimsonweb.invalid"
+UDPProbeValue = bytes | Callable[[], bytes]
+BLOCK_CONTEXT_STATUS_CODES = frozenset({401, 403, 406, 407, 409, 418, 429, 451, 503})
+SYN_MAX_BATCH_SIZE = 1024
 JITTER_LOW = 0.7
 JITTER_HIGH = 1.5
 PACING_BASELINE_WINDOW = 10
@@ -177,9 +200,18 @@ SENSITIVE_ENDPOINT_KEYWORDS = (
 )
 SENSITIVE_PATHS = (
     "/.env", "/.git/config", "/.git/HEAD", "/robots.txt",
-    "/server-status", "/server-info", "/admin", "/wp-config.php",
-    "/config.php", "/.htpasswd", "/api/swagger.json",
-    "/actuator/health", "/.DS_Store", "/phpinfo.php",
+    "/server-status", "/server-info", "/admin", "/administrator",
+    "/wp-config.php", "/config.php", "/config.json", "/.htpasswd",
+    "/.well-known/security.txt", "/api/swagger.json", "/swagger.json",
+    "/swagger-ui.html", "/openapi.json", "/graphql", "/graphiql",
+    "/actuator", "/actuator/health", "/actuator/env", "/actuator/metrics",
+    "/.DS_Store", "/phpinfo.php", "/backup.zip", "/db.sql",
+)
+API_DISCOVERY_PATHS = (
+    "/api", "/api/", "/api/v1", "/api/v1/", "/api/v2", "/api/v2/",
+    "/graphql", "/graphiql", "/swagger", "/swagger/", "/swagger-ui.html",
+    "/swagger.json", "/api-docs", "/api-docs/", "/openapi.json",
+    "/docs", "/redoc", "/health", "/status", "/metrics",
 )
 GENERIC_USER_AGENTS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -201,9 +233,52 @@ WEB_PORT_HINTS = frozenset({
 TLS_PORT_HINTS = frozenset({
     443, 465, 563, 587, 636, 853, 989, 990, 992, 993, 995, 8443, 8834, 9443,
 })
-UDP_PROBES: dict[int, bytes] = {
+def _ike_transform(last: int, transform_type: int, transform_id: int, attrs: bytes = b"") -> bytes:
+    length = 8 + len(attrs)
+    return (
+        bytes([last, 0])
+        + length.to_bytes(2, "big")
+        + bytes([transform_type, 0])
+        + transform_id.to_bytes(2, "big")
+        + attrs
+    )
+def build_ikev2_sa_init_probe() -> bytes:
+    """Build a syntactically valid IKEv2 SA_INIT probe with random SPI/nonce."""
+    transforms = b"".join(
+        (
+            _ike_transform(0, 1, 12, b"\x80\x0e\x01\x00"),  # ENCR_AES_CBC, key length 256
+            _ike_transform(0, 2, 5),  # PRF_HMAC_SHA2_256
+            _ike_transform(0, 3, 12),  # AUTH_HMAC_SHA2_256_128
+            _ike_transform(3, 4, 14),  # 2048-bit MODP group
+        )
+    )
+    proposal = (
+        b"\x02\x00"
+        + (8 + len(transforms)).to_bytes(2, "big")
+        + b"\x01\x01\x00\x04"
+        + transforms
+    )
+    sa_payload = b"\x22\x00" + (4 + len(proposal)).to_bytes(2, "big") + proposal
+    ke_data = os.urandom(256)
+    ke_payload = b"\x28\x00" + (8 + len(ke_data)).to_bytes(2, "big") + b"\x00\x0e\x00\x00" + ke_data
+    nonce = os.urandom(32)
+    nonce_payload = b"\x00\x00" + (4 + len(nonce)).to_bytes(2, "big") + nonce
+    body = sa_payload + ke_payload + nonce_payload
+    return (
+        os.urandom(8)
+        + (b"\x00" * 8)
+        + b"\x21\x20\x22\x08"
+        + (0).to_bytes(4, "big")
+        + (28 + len(body)).to_bytes(4, "big")
+        + body
+    )
+UDP_PROBES: dict[int, UDPProbeValue] = {
     53: b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07version\x04bind\x00\x00\x10\x00\x03",
+    69: b"\x00\x01crimson-probe\x00octet\x00",
+    123: b"\x1b" + (b"\x00" * 47),
     161: b"\x30\x26\x02\x01\x01\x04\x06public\xa0\x19\x02\x04\x70\x69\x6e\x67\x02\x01\x00\x02\x01\x00\x30\x0b\x30\x09\x06\x05\x2b\x06\x01\x02\x01\x05\x00",
+    500: build_ikev2_sa_init_probe,
+    514: b"<14>crimsonweb udp assessment probe\n",
     1900: (
         b"M-SEARCH * HTTP/1.1\r\n"
         b"HOST: 239.255.255.250:1900\r\n"
@@ -211,8 +286,22 @@ UDP_PROBES: dict[int, bytes] = {
         b"MX: 1\r\n"
         b"ST: ssdp:all\r\n\r\n"
     ),
+    5353: (
+        b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        b"\x09_services\x07_dns-sd\x04_udp\x05local\x00"
+        b"\x00\x0c\x00\x01"
+    ),
 }
-UDP_SERVICE_HINTS = {53: "dns", 161: "snmp", 1900: "ssdp"}
+UDP_SERVICE_HINTS = {
+    53: "dns",
+    69: "tftp",
+    123: "ntp",
+    161: "snmp",
+    500: "ike",
+    514: "syslog",
+    1900: "ssdp",
+    5353: "mdns",
+}
 LOW_CONFIDENCE_PORT_HINTS: dict[int, tuple[str, str]] = {
     9929: ("nping-echo", "Nping Echo service (port heuristic)"),
     31337: ("elite", "Port-based heuristic on 31337/tcp"),
@@ -234,53 +323,174 @@ CPE_PRODUCT_MAP: dict[str, tuple[str, str]] = {
     "vsftpd": ("vsftpd", "vsftpd"),
     "pure-ftpd": ("pureftpd", "pure-ftpd"),
 }
-DEFAULT_STATE_DIR = "~/.crimson/state"
+CPE_SERVICE_PRODUCTS: dict[str, frozenset[str]] = {
+    "http": frozenset({"apache", "apache httpd", "nginx", "microsoft-iis", "microsoft iis", "iis", "apache tomcat"}),
+    "https": frozenset({"apache", "apache httpd", "nginx", "microsoft-iis", "microsoft iis", "iis", "apache tomcat"}),
+    "ssh": frozenset({"openssh", "open ssh"}),
+    "mysql": frozenset({"mysql", "mariadb"}),
+    "postgresql": frozenset({"postgresql"}),
+    "ftp": frozenset({"proftpd", "vsftpd", "pure-ftpd"}),
+}
+DEFAULT_STATE_DIR = "~/.crimsonweb/state"
 ROE_REF_PATTERN = re.compile(r"^[A-Za-z0-9._\-:/]{4,128}$")
 # Curated top ports — duplicates removed via set()
-_RAW_TOP_PORTS = [
-    1, 3, 4, 6, 7, 9, 13, 17, 19, 20, 21, 22, 23, 24, 25, 26, 30, 32, 33,
-    37, 42, 43, 49, 53, 70, 79, 80, 81, 82, 83, 84, 85, 88, 89, 90, 99, 100,
-    106, 109, 110, 111, 113, 119, 125, 135, 139, 143, 144, 146, 161, 163,
-    179, 199, 211, 212, 222, 254, 255, 256, 259, 264, 280, 301, 306, 311,
-    340, 366, 389, 395, 406, 407, 416, 417, 425, 427, 443, 444, 445, 458,
-    464, 465, 475, 481, 497, 500, 512, 513, 514, 515, 524, 541, 543, 544,
-    545, 548, 554, 555, 563, 587, 593, 616, 617, 625, 631, 636, 646, 648,
-    666, 667, 668, 683, 687, 691, 700, 705, 709, 711, 714, 720, 722, 726,
-    727, 730, 731, 740, 749, 765, 783, 787, 800, 801, 808, 843, 873, 880,
-    888, 898, 900, 901, 902, 903, 911, 912, 981, 987, 990, 992, 993, 995,
-    999, 1000, 1024, 1025, 1080, 1110, 1234, 1311, 1433, 1434, 1521,
-    1604, 1701, 1720, 1723, 1755, 1812, 1900, 2000, 2049, 2082, 2083,
-    2086, 2087, 2095, 2096, 2222, 2375, 2376, 2483, 2484, 2638, 3128,
-    3260, 3268, 3269, 3306, 3389, 3478, 3690, 3724, 4040, 4369, 4443,
-    4444, 4500, 4567, 4789, 4848, 5000, 5001, 5005, 5060, 5061, 5222,
-    5269, 5353, 5432, 5555, 5601, 5631, 5666, 5672, 5800, 5900, 5984,
-    5985, 5986, 6000, 6379, 6443, 6660, 6661, 6662, 6663, 6664, 6665,
-    6666, 6667, 6668, 6669, 6697, 7000, 7001, 7002, 7077, 7474, 7547,
-    7777, 8000, 8001, 8008, 8009, 8010, 8025, 8080, 8081, 8086, 8088,
-    8089, 8090, 8125, 8161, 8181, 8333, 8443, 8500, 8530, 8531, 8649,
-    8834, 8880, 8888, 9000, 9001, 9042, 9043, 9080, 9090, 9091, 9092,
-    9100, 9200, 9300, 9418, 9443, 9999, 10000, 10001, 10250, 10255,
-    11211, 15672, 16379, 25565, 27017, 27018, 27019, 28015, 31337,
-    32400, 32768, 49152, 50000, 50070, 54321, 60000, 61613, 61614,
-]
-TOP_PORTS = sorted(set(_RAW_TOP_PORTS))
+BUILTIN_TOP_PORTS_SPEC = """
+1,3-4,6-7,9,13,17,19-26,30,32-33,37,42-43,49,53,70,79-85,88-90,99-100,
+106,109-111,113,119,125,135,139,143-144,146,161,163,179,199,211-212,222,
+254-256,259,264,280,301,306,311,340,366,389,406-407,416-417,425,427,
+443-445,458,464-465,481,497,500,512-515,524,541,543-545,548,554-555,563,
+587,593,616-617,625,631,636,646,648,666-668,683,687,691,700,705,711,714,
+720,722,726,749,765,777,783,787,800-801,808,843,873,880,888,898,900-903,
+911-912,981,987,990,992-993,995,999-1002,1007,1009-1011,1021-1100,1102,
+1104-1108,1110-1114,1117,1119,1121-1124,1126,1130-1132,1137-1138,1141,
+1145,1147-1149,1151-1152,1154,1163-1166,1169,1174-1175,1183,1185-1187,
+1192,1198-1199,1201,1213,1216-1218,1233-1234,1236,1244,1247-1248,1259,
+1271-1272,1277,1287,1296,1300-1301,1309-1311,1322,1328,1334,1352,1417,
+1433-1434,1443,1455,1461,1494,1500-1501,1503,1521,1524,1533,1556,1580,
+1583,1594,1600,1641,1658,1666,1687-1688,1700,1717-1721,1723,1755,1761,
+1782-1783,1801,1805,1812,1839-1840,1862-1864,1875,1900,1914,1935,1947,
+1971-1972,1974,1984,1998-2010,2013,2020-2022,2030,2033-2035,2038,
+2040-2043,2045-2049,2065,2068,2099-2100,2103,2105-2107,2111,2119,2121,
+2126,2135,2144,2160-2161,2170,2179,2190-2191,2196,2200,2222,2251,2260,
+2288,2301,2323,2366,2381-2383,2393-2394,2399,2401,2492,2500,2522,2525,
+2557,2601-2602,2604-2605,2607-2608,2638,2701-2702,2710,2717-2718,2725,
+2800,2809,2811,2869,2875,2909-2910,2920,2967-2968,2998,3000-3001,3003,
+3005-3007,3011,3013,3017,3030-3031,3052,3071,3077,3128,3168,3211,3221,
+3260-3261,3268-3269,3283,3300-3301,3306,3322-3325,3333,3351,3367,
+3369-3372,3389-3390,3404,3476,3493,3517,3527,3546,3551,3580,3659,
+3689-3690,3703,3737,3766,3784,3800-3801,3809,3814,3826-3828,3851,3869,
+3871,3878,3880,3889,3905,3914,3918,3920,3945,3971,3986,3995,3998,
+4000-4006,4045,4111,4125-4126,4129,4224,4242,4279,4321,4343,4443-4446,
+4449,4550,4567,4662,4848,4899-4900,4998,5000-5004,5009,5030,5033,
+5050-5051,5054,5060-5061,5080,5087,5100-5102,5120,5190,5200,5214,
+5221-5222,5225-5226,5269,5280,5298,5357,5405,5414,5431-5432,5440,5500,
+5510,5544,5550,5555,5560,5566,5631,5633,5666,5678-5679,5718,5730,
+5800-5802,5810-5811,5815,5822,5825,5850,5859,5862,5877,5900-5904,
+5906-5907,5910-5911,5915,5922,5925,5950,5952,5959-5963,5987-5989,
+5998-6007,6009,6025,6059,6100-6101,6106,6112,6123,6129,6156,6346,
+6389,6502,6510,6543,6547,6565-6567,6580,6646,6666-6669,6689,6692,
+6699,6779,6788-6789,6792,6839,6881,6901,6969,7000-7002,7004,7007,
+7019,7025,7070,7100,7103,7106,7200-7201,7402,7435,7443,7496,7512,
+7625,7627,7676,7741,7777-7778,7800,7911,7920-7921,7937-7938,7999-8002,
+8007-8011,8021-8022,8031,8042,8045,8080-8090,8093,8099-8100,8180-8181,
+8192-8194,8200,8222,8254,8290-8292,8300,8333,8383,8400,8402,8443,8500,
+8600,8649,8651-8652,8654,8701,8800,8873,8888,8899,8994,9000-9003,
+9009-9011,9040,9050,9071,9080-9081,9090-9091,9099-9103,9110-9111,9200,
+9207,9220,9290,9415,9418,9485,9500,9502-9503,9535,9575,9593-9595,9618,
+9666,9876-9878,9898,9900,9917,9929,9943-9944,9968,9998-10004,
+10009-10010,10012,10024-10025,10082,10180,10215,10243,10566,10616-10617,
+10621,10626,10628-10629,10778,11110-11111,11967,12000,12174,12265,12345,
+13456,13722,13782-13783,14000,14238,14441-14442,15000,15002-15004,15660,
+15742,16000-16001,16012,16016,16018,16080,16113,16992-16993,17877,17988,
+18040,18101,18988,19101,19283,19315,19350,19780,19801,19842,20000,20005,
+20031,20221-20222,20828,21571,22939,23502,24444,24800,25734-25735,26214,
+27000,27352-27353,27355-27356,27715,28201,30000,30718,30951,31038,31337,
+32768-32785,33354,33899,34571-34573,35500,38292,40193,40911,41511,42510,
+44176,44442-44443,44501,45100,48080,49152-49161,49163,49165,49167,
+49175-49176,49400,49999-50003,50006,50300,50389,50500,50636,50800,51103,
+51493,52673,52822,52848,52869,54045,54328,55055-55056,55555,55600,
+56737-56738,57294,57797,58080,60020,60443,61532,61900,62078,63331,64623,
+64680,65000,65129,65389,280,4567,7001,8008,9080
+"""
+def _expand_port_spec(spec: str) -> list[int]:
+    ports: list[int] = []
+    seen: set[int] = set()
+    for chunk in spec.replace("\n", "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            start_s, end_s = chunk.split("-", 1)
+            start, end = int(start_s), int(end_s)
+            values = range(start, end + 1)
+        else:
+            values = (int(chunk),)
+        for port in values:
+            if 1 <= port <= 65535 and port not in seen:
+                ports.append(port)
+                seen.add(port)
+    return ports
+TOP_PORTS = _expand_port_spec(BUILTIN_TOP_PORTS_SPEC)
 # --------------------------------------------------------------------------
 # Audit logging — text + JSONL
 # --------------------------------------------------------------------------
-_JSONL_LOCK = threading.Lock()
+_JSONL_LOCK = threading.RLock()
 _JSONL_PATH: Path | None = None
+_JSONL_QUEUE: queue.Queue[str | None] | None = None
+_JSONL_THREAD: threading.Thread | None = None
+def _chmod_private(path: Path) -> None:
+    try:
+        os.chmod(path, PRIVATE_LOG_MODE)
+    except OSError:
+        pass
+def _jsonl_writer(handle, items: queue.Queue[str | None]) -> None:
+    try:
+        while True:
+            line = items.get()
+            if line is None:
+                break
+            handle.write(line)
+            handle.flush()
+    except OSError as exc:
+        logging.warning("audit writer failed: %s", exc)
+    finally:
+        try:
+            handle.flush()
+            handle.close()
+        except OSError:
+            pass
+def _close_audit_log_locked() -> None:
+    global _JSONL_QUEUE, _JSONL_THREAD
+    queue_ref = _JSONL_QUEUE
+    thread_ref = _JSONL_THREAD
+    _JSONL_QUEUE = None
+    _JSONL_THREAD = None
+    if queue_ref is not None:
+        queue_ref.put(None)
+    if thread_ref is not None and thread_ref.is_alive():
+        thread_ref.join(timeout=3.0)
+        if thread_ref.is_alive():
+            logging.warning("audit writer did not stop cleanly before timeout")
+def _bind_jsonl_path(jsonl_path: Path) -> None:
+    global _JSONL_PATH, _JSONL_QUEUE, _JSONL_THREAD
+    with _JSONL_LOCK:
+        if (
+            _JSONL_PATH == jsonl_path
+            and _JSONL_QUEUE is not None
+            and _JSONL_THREAD is not None
+            and _JSONL_THREAD.is_alive()
+        ):
+            return
+        _close_audit_log_locked()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        fd = os.open(str(jsonl_path), flags, PRIVATE_LOG_MODE)
+        handle = os.fdopen(fd, "a", encoding="utf-8", buffering=1)
+        _JSONL_QUEUE = queue.Queue()
+        _JSONL_THREAD = threading.Thread(
+            target=_jsonl_writer,
+            args=(handle, _JSONL_QUEUE),
+            name="crimsonweb-audit-jsonl",
+            daemon=False,
+        )
+        _JSONL_THREAD.start()
+        _JSONL_PATH = jsonl_path
+        _chmod_private(jsonl_path)
+def close_audit_log() -> None:
+    with _JSONL_LOCK:
+        _close_audit_log_locked()
 def setup_logging(output_dir: Path | str = ".") -> None:
     """Configure text logger and bind JSONL path. Idempotent."""
-    global _JSONL_PATH
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
     text_path = (out / LOG_FILE_TEXT).resolve()
     jsonl_path = (out / LOG_FILE_JSONL).resolve()
+    _bind_jsonl_path(jsonl_path)
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     for handler in logger.handlers:
         if getattr(handler, "baseFilename", None) == str(text_path):
-            _JSONL_PATH = jsonl_path
             return
     handler = RotatingFileHandler(
         str(text_path),
@@ -291,7 +501,7 @@ def setup_logging(output_dir: Path | str = ".") -> None:
     handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter("%(asctime)s - [%(levelname)s] - %(message)s"))
     logger.addHandler(handler)
-    _JSONL_PATH = jsonl_path
+    _chmod_private(text_path)
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 def audit_event(event: str, **fields: Any) -> None:
@@ -303,10 +513,35 @@ def audit_event(event: str, **fields: Any) -> None:
     line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
     try:
         with _JSONL_LOCK:
-            with _JSONL_PATH.open("a", encoding="utf-8") as fh:
-                fh.write(line)
+            if _JSONL_QUEUE is None or _JSONL_THREAD is None or not _JSONL_THREAD.is_alive():
+                _bind_jsonl_path(_JSONL_PATH)
+            if _JSONL_QUEUE is not None:
+                _JSONL_QUEUE.put(line)
     except OSError as exc:
         logging.warning("audit_event failed: %s", exc)
+def redact_cli_args(argv: list[str]) -> str:
+    """Return command-line text with sensitive option values masked."""
+    redacted: list[str] = []
+    redact_next = False
+    for arg in argv:
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        matched = False
+        for option in SENSITIVE_CLI_OPTIONS:
+            if arg == option:
+                redacted.append(arg)
+                redact_next = True
+                matched = True
+                break
+            if arg.startswith(f"{option}="):
+                redacted.append(f"{option}=<redacted>")
+                matched = True
+                break
+        if not matched:
+            redacted.append(arg)
+    return " ".join(redacted)
 class TimingScope:
     __slots__ = ("_started", "elapsed_ms")
     def __init__(self) -> None:
@@ -335,7 +570,7 @@ class WebFinding:
 class WebResponse:
     url: str
     status: int
-    headers: dict[str, str]
+    headers: dict[str, Any]
     body: bytes
     proxy: str | None = None
     egress_id: str | None = None
@@ -357,12 +592,82 @@ class ServiceResult:
     tls: bool = False
     http_status: int | None = None
     title: str | None = None
-    headers: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, Any] = field(default_factory=dict)
     waf: str | None = None
     sensitive_paths: list[WebFinding] = field(default_factory=list)
+    api_paths: list[WebFinding] = field(default_factory=list)
+    security_headers: list[dict[str, Any]] = field(default_factory=list)
+    cookie_findings: list[dict[str, Any]] = field(default_factory=list)
+    cors_findings: list[dict[str, Any]] = field(default_factory=list)
+    tls_certificate: dict[str, Any] = field(default_factory=dict)
+    mitre_attack: list[dict[str, str]] = field(default_factory=list)
     cves: list[dict[str, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     os_hint: str | None = None
+def _add_mitre_mapping(
+    mappings: list[dict[str, str]],
+    seen: set[str],
+    technique_id: str,
+    technique: str,
+    reason: str,
+) -> None:
+    if technique_id in seen:
+        return
+    seen.add(technique_id)
+    mappings.append({"id": technique_id, "technique": technique, "reason": reason})
+def mitre_mappings_for_result(result: ServiceResult) -> list[dict[str, str]]:
+    mappings: list[dict[str, str]] = []
+    seen: set[str] = set()
+    if result.state == "open":
+        _add_mitre_mapping(
+            mappings,
+            seen,
+            "T1046",
+            "Network Service Discovery",
+            "Open service exposed during authorized discovery",
+        )
+    if result.service in {"http", "https"} and (
+        result.cves or result.cors_findings or result.security_headers or result.cookie_findings
+    ):
+        _add_mitre_mapping(
+            mappings,
+            seen,
+            "T1190",
+            "Exploit Public-Facing Application",
+            "Public-facing web weakness or vulnerable component indicator",
+        )
+    if any(re.search(r"(\.env|\.git|config|wp-config|\.htpasswd)", item.path, re.IGNORECASE)
+           for item in result.sensitive_paths):
+        _add_mitre_mapping(
+            mappings,
+            seen,
+            "T1552.001",
+            "Credentials In Files",
+            "Sensitive configuration or credential-like path exposure",
+        )
+    if result.api_paths:
+        _add_mitre_mapping(
+            mappings,
+            seen,
+            "T1595.002",
+            "Vulnerability Scanning",
+            "API documentation or endpoint indicator useful for external reconnaissance",
+        )
+    remote_service_map = {
+        "ssh": ("T1021.004", "SSH"),
+        "rdp": ("T1021.001", "Remote Desktop Protocol"),
+        "smb": ("T1021.002", "SMB/Windows Admin Shares"),
+    }
+    mapped = remote_service_map.get(result.service)
+    if mapped:
+        _add_mitre_mapping(
+            mappings,
+            seen,
+            mapped[0],
+            mapped[1],
+            f"{result.service.upper()} remote access service exposed",
+        )
+    return mappings
 # --------------------------------------------------------------------------
 # State (checkpoint/resume)
 # --------------------------------------------------------------------------
@@ -502,21 +807,40 @@ class TorControlClient:
     @staticmethod
     def _quoted(value: str) -> str:
         return json.dumps(value)
+    @staticmethod
+    def _allowed_cookie_roots() -> tuple[Path, ...]:
+        roots = (Path("/var/run/tor"), Path("/var/lib/tor"), Path("/run/tor"), Path.home())
+        resolved: list[Path] = []
+        for root in roots:
+            try:
+                resolved.append(root.expanduser().resolve(strict=True))
+            except OSError:
+                continue
+        return tuple(dict.fromkeys(resolved))
+    @classmethod
+    def _resolve_cookie_file(cls, cookie_file: str) -> Path:
+        path = Path(cookie_file).expanduser()
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(f"Tor cookie file not found: {path}") from exc
+        if not resolved.is_file():
+            raise RuntimeError(f"Tor cookie path is not a file: {resolved}")
+        allowed_roots = cls._allowed_cookie_roots()
+        if not allowed_roots or not any(
+            resolved == root or resolved.is_relative_to(root) for root in allowed_roots
+        ):
+            allowed = ", ".join(str(root) for root in allowed_roots) or "<none>"
+            raise RuntimeError(
+                f"Refusing to read Tor cookie outside permitted directories: {resolved} "
+                f"(allowed roots: {allowed})"
+            )
+        return resolved
     def _auth_command(self) -> str:
         if self.password is not None:
             return f"AUTHENTICATE {self._quoted(self.password)}"
         if self.cookie_file:
-            path = Path(self.cookie_file)
-            allowed_prefixes = (
-                "/var/run/tor", "/var/lib/tor", "/run/tor", str(Path.home())
-            )
-            resolved = str(path.resolve())
-            if not any(resolved.startswith(prefix) for prefix in allowed_prefixes):
-                raise RuntimeError(
-                    f"Refusing to read Tor cookie outside permitted directories: {resolved}"
-                )
-            if not path.exists():
-                raise RuntimeError(f"Tor cookie file not found: {path}")
+            path = self._resolve_cookie_file(self.cookie_file)
             return f"AUTHENTICATE {path.read_bytes().hex()}"
         return "AUTHENTICATE"
     @staticmethod
@@ -541,7 +865,7 @@ class TorControlClient:
         if require_ok:
             self._ensure_ok(lines, command)
         return lines
-    def signal_new_identity(self) -> None:
+    def signal_new_identity(self, strict: bool = False) -> None:
         try:
             with socket.create_connection((self.host, self.port), timeout=8.0) as sock:
                 reader = sock.makefile("rb")
@@ -551,6 +875,8 @@ class TorControlClient:
         except (OSError, RuntimeError) as exc:
             audit_event("tor_newnym_failed", error=str(exc))
             logging.warning("SIGNAL NEWNYM failed: %s", exc)
+            if strict:
+                raise SystemExit(f"Tor NEWNYM failed: {exc}") from exc
             return
         audit_event("tor_newnym_ok", wait_seconds=self.new_identity_wait)
         if self.new_identity_wait:
@@ -587,6 +913,11 @@ def _validate_proxy_url(proxy_url: str) -> str:
         )
     if not parsed.hostname:
         raise SystemExit(f"Proxy URL must include a host: {proxy_url!r}")
+    if scheme in SOCKS_PROXY_SCHEMES and scheme not in REMOTE_DNS_SOCKS_SCHEMES:
+        raise SystemExit(
+            f"SOCKS proxy URL must use remote-DNS scheme socks5h/socks4a, got {scheme!r}: "
+            f"{redact_proxy_url(proxy_url)}"
+        )
     return proxy_url
 class EgressPool:
     """Selects egress nodes per request and manages cooldowns."""
@@ -694,6 +1025,41 @@ def build_pool_tor_only(
     _validate_proxy_url(socks_url)
     tor = EgressNode(id="tor-default", kind=EgressKind.TOR, url=socks_url, role="general")
     return EgressPool([tor], mode=EgressMode.TOR_ONLY, tor_control=tor_control)
+def _proxy_kind(proxy_url: str) -> EgressKind:
+    scheme = urlsplit(proxy_url).scheme.lower()
+    return EgressKind.TOR if scheme in SOCKS_PROXY_SCHEMES else EgressKind.PROXY
+def _read_legacy_proxy_urls(args) -> list[str]:
+    urls: list[str] = []
+    if getattr(args, "web_proxy", None):
+        urls.append(args.web_proxy)
+    proxy_file = getattr(args, "web_proxy_file", None)
+    if proxy_file:
+        path = Path(proxy_file).expanduser()
+        if not path.exists():
+            raise SystemExit(f"Proxy file not found: {path}")
+        for line in path.read_text(encoding="utf-8").splitlines():
+            value = line.strip()
+            if value and not value.startswith("#"):
+                urls.append(value)
+    return urls
+def build_pool_from_legacy_args(args, tor_control: TorControlClient | None = None) -> EgressPool:
+    urls = _read_legacy_proxy_urls(args)
+    nodes: list[EgressNode] = []
+    for index, proxy_url in enumerate(urls, start=1):
+        _validate_proxy_url(proxy_url)
+        kind = _proxy_kind(proxy_url)
+        nodes.append(
+            EgressNode(
+                id=f"legacy-{kind.value}-{index}",
+                kind=kind,
+                url=proxy_url,
+                role="general",
+            )
+        )
+    if not nodes:
+        return build_pool_direct()
+    mode = EgressMode.TOR_ONLY if all(n.kind == EgressKind.TOR for n in nodes) else EgressMode.MULTI_EGRESS
+    return EgressPool(nodes, mode=mode, tor_control=tor_control)
 def build_pool_from_yaml(yaml_path: str, tor_control: TorControlClient | None = None) -> EgressPool:
     if _yaml is None:
         raise SystemExit("PyYAML required for --egress-config. Install: pip install pyyaml")
@@ -707,6 +1073,11 @@ def build_pool_from_yaml(yaml_path: str, tor_control: TorControlClient | None = 
         mode = EgressMode(mode_str)
     except ValueError as exc:
         raise SystemExit(f"Invalid egress mode in YAML: {mode_str}") from exc
+    if mode == EgressMode.DIRECT:
+        raise SystemExit(
+            "--egress-config cannot use mode: direct. Omit --egress-config for direct mode, "
+            "or use mode: multi_egress/tor_only for proxy-routed web-only checks."
+        )
     nodes: list[EgressNode] = []
     tor_cfg = data.get("tor") or {}
     if tor_cfg.get("enabled"):
@@ -747,6 +1118,8 @@ def build_egress_from_args(args) -> EgressPool:
         return build_pool_from_yaml(args.egress_config, tor_control=_maybe_tor_control(args))
     if getattr(args, "web_tor", False):
         return build_pool_tor_only(tor_control=_maybe_tor_control(args))
+    if getattr(args, "web_proxy", None) or getattr(args, "web_proxy_file", None):
+        return build_pool_from_legacy_args(args, tor_control=_maybe_tor_control(args))
     return build_pool_direct()
 # --------------------------------------------------------------------------
 # Ban signal analyzer
@@ -785,15 +1158,17 @@ class BanSignalAnalyzer:
         if status in self.stop_statuses:
             self._soft_count[egress_id] = 0
             return True, f"hard:http_{status}"
-        # Body pattern signal (regex with word boundaries — no false matches on
-        # the literal substring 'waf' appearing in document content)
-        text_sample = body[:4096].decode("utf-8", errors="ignore")
+        soft_reasons: list[str] = []
+        # Body pattern signal. On 2xx pages this is soft to reduce false positives.
+        text_sample = memoryview(body)[:4096].tobytes().decode("utf-8", errors="ignore")
         match = _BLOCK_BODY_RE.search(text_sample)
         if match:
-            self._soft_count[egress_id] = 0
-            return True, f"hard:body_pattern:{match.group(0)[:32]}"
+            reason = f"body_pattern:{match.group(0)[:32]}"
+            if status in BLOCK_CONTEXT_STATUS_CODES:
+                self._soft_count[egress_id] = 0
+                return True, f"hard:{reason}"
+            soft_reasons.append(f"soft:{reason}")
         # Soft signals (require accumulation)
-        soft_reasons: list[str] = []
         bucket = self._bucket(egress_id)
         if len(bucket) >= 5:
             recent_latencies = [item[1] for item in bucket if item[1] > 0]
@@ -885,7 +1260,13 @@ class DecoyInjector:
 # --------------------------------------------------------------------------
 # Passive recon — discover real paths for decoy pool
 # --------------------------------------------------------------------------
-async def passive_recon(target_url: str, timeout: float = 5.0) -> list[str]:
+async def passive_recon(
+    target_url: str,
+    timeout: float = 5.0,
+    web_controller: Any | None = None,
+    verify_tls: bool = True,
+    max_links: int = RECON_MAX_LINKS,
+) -> list[str]:
     """Fetch robots.txt + sitemap.xml + homepage; extract internal paths."""
     if aiohttp is None:
         return []
@@ -899,38 +1280,64 @@ async def passive_recon(target_url: str, timeout: float = 5.0) -> list[str]:
         f"{base}/sitemap.xml",
         f"{base}/",
     ]
+    async def fetch(session, url: str) -> tuple[str, int, bytes] | None:
+        try:
+            if web_controller is not None:
+                ssl_policy = web_controller.ssl_policy() if hasattr(web_controller, "ssl_policy") else None
+                response = await web_controller.request(
+                    session,
+                    url,
+                    client_timeout,
+                    ssl_policy=ssl_policy,
+                    allow_redirects=True,
+                    is_decoy=True,
+                )
+                if response is None:
+                    return None
+                return url, response.status, response.body
+            async with session.get(
+                url,
+                allow_redirects=True,
+                ssl=None if verify_tls else False,
+            ) as resp:
+                body = await resp.read()
+                return url, resp.status, body
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            return None
     async with aiohttp.ClientSession(timeout=client_timeout, headers=headers) as session:
-        for url in candidate_urls:
-            try:
-                async with session.get(url, allow_redirects=True) as resp:
-                    if resp.status != 200:
-                        continue
-                    body = await resp.read()
-                    text = body.decode("utf-8", errors="ignore")
-                    if url.endswith("robots.txt"):
-                        for line in text.splitlines():
-                            line = line.strip()
-                            if line.lower().startswith(("allow:", "disallow:")):
-                                _, _, path = line.partition(":")
-                                path = path.strip()
-                                if path and path.startswith("/") and path != "/":
-                                    discovered.add(path)
-                    elif url.endswith("sitemap.xml"):
-                        for match in re.finditer(r"<loc>([^<]+)</loc>", text):
-                            loc = match.group(1).strip()
-                            loc_parsed = urlsplit(loc)
-                            if loc_parsed.netloc == parsed.netloc and loc_parsed.path:
-                                discovered.add(loc_parsed.path)
-                    else:
-                        for match in re.finditer(
-                            r'href=["\'](/[^"\'#?\s]+)', text, re.IGNORECASE
-                        ):
-                            href = match.group(1)
-                            if not href.startswith("//"):
-                                discovered.add(href)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        results = await asyncio.gather(
+            *(fetch(session, url) for url in candidate_urls),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, Exception) or result is None:
                 continue
-    paths = sorted(discovered)[:RECON_MAX_LINKS]
+            url, status, body = result
+            if status != 200:
+                continue
+            text = body.decode("utf-8", errors="ignore")
+            if url.endswith("robots.txt"):
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith(("allow:", "disallow:")):
+                        _, _, path = line.partition(":")
+                        path = path.strip()
+                        if path and path.startswith("/") and path != "/":
+                            discovered.add(path)
+            elif url.endswith("sitemap.xml"):
+                for match in re.finditer(r"<loc>([^<]+)</loc>", text):
+                    loc = match.group(1).strip()
+                    loc_parsed = urlsplit(loc)
+                    if loc_parsed.netloc == parsed.netloc and loc_parsed.path:
+                        discovered.add(loc_parsed.path)
+            else:
+                for match in re.finditer(
+                    r'href=["\'](/[^"\'#?\s]+)', text, re.IGNORECASE
+                ):
+                    href = match.group(1)
+                    if not href.startswith("//"):
+                        discovered.add(href)
+    paths = sorted(discovered)[:max(0, max_links)]
     audit_event("passive_recon_done", target=target_url, paths_found=len(paths))
     return paths
 # --------------------------------------------------------------------------
@@ -950,6 +1357,7 @@ class WebRequestController:
         max_retries: int = 0,
         user_agent: str | None = None,
         fingerprint: str | None = None,
+        verify_tls: bool = True,
         state: ScanState | None = None,
         state_path: Path | None = None,
     ) -> None:
@@ -960,6 +1368,7 @@ class WebRequestController:
         self.max_retries = max(0, max_retries)
         self.user_agent = user_agent
         self.fingerprint = fingerprint if (fingerprint and CURL_CFFI_AVAILABLE) else None
+        self.verify_tls = verify_tls
         self.state = state
         self.state_path = state_path
         self.block_events: list[WebBlockEvent] = []
@@ -973,22 +1382,37 @@ class WebRequestController:
     @property
     def uses_proxy(self) -> bool:
         return self.egress.mode != EgressMode.DIRECT
+    def ssl_policy(self):
+        return None if self.verify_tls else False
     @staticmethod
     def _target_key(url: str) -> tuple[str, str]:
         parsed = urlsplit(url)
         return parsed.netloc.lower(), parsed.path or "/"
     def is_blocked(self, url: str) -> bool:
         return self._target_key(url) in self._blocked_targets
-    def _build_headers(self) -> dict[str, str]:
+    def _build_headers(self, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
         ua = self.user_agent or random.choice(GENERIC_USER_AGENTS)
         # Chrome-like header ordering (Python dicts preserve insertion order)
-        return {
+        headers = {
             "User-Agent": ua,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate",
             "Connection": "close",
         }
+        if extra_headers:
+            headers.update(extra_headers)
+        return headers
+    @staticmethod
+    def _response_headers(headers) -> dict[str, Any]:
+        normalized = {str(k).lower(): v for k, v in dict(headers).items()}
+        getall = getattr(headers, "getall", None)
+        if callable(getall):
+            cookies = list(getall("Set-Cookie", []))
+            if cookies:
+                normalized["set-cookie-list"] = cookies
+                normalized["set-cookie"] = cookies[0] if len(cookies) == 1 else cookies
+        return normalized
     async def _persist_state_if_any(self) -> None:
         if self.state is None or self.state_path is None:
             return
@@ -1020,6 +1444,8 @@ class WebRequestController:
         ssl_policy,
         allow_redirects: bool = False,
         is_decoy: bool = False,
+        extra_headers: dict[str, str] | None = None,
+        block_on_ban: bool = True,
     ) -> WebResponse | None:
         if self.is_blocked(url):
             audit_event("skip_blocked", url=url)
@@ -1038,7 +1464,7 @@ class WebRequestController:
                 await asyncio.sleep(30.0)
                 continue
             await self.pacer.wait(url)
-            headers = self._build_headers()
+            headers = self._build_headers(extra_headers)
             timer = TimingScope()
             try:
                 with timer:
@@ -1083,6 +1509,16 @@ class WebRequestController:
                 node.id, response.status, response.body, response.latency_ms
             )
             if banned and reason is not None:
+                if not block_on_ban:
+                    audit_event(
+                        "http_block_signal_observed",
+                        url=url,
+                        status=response.status,
+                        egress_id=node.id,
+                        reason=reason,
+                    )
+                    self.egress.mark_success(node)
+                    return response
                 self.egress.mark_banned(node, reason)
                 self._blocked_targets.add(self._target_key(url))
                 event = WebBlockEvent(
@@ -1116,8 +1552,7 @@ class WebRequestController:
         # curl_cffi path: full JA3/TLS fingerprint spoofing
         if self.fingerprint:
             return await self._send_via_curl_cffi(url, node, headers, timeout, allow_redirects)
-        # SOCKS proxy via aiohttp_socks (new connector per request — pooling
-        # would help perf but breaks per-node cooldown semantics)
+        # SOCKS proxy via aiohttp_socks. Sessions are pooled per proxy URL.
         if node.url and urlsplit(node.url).scheme.lower() in SOCKS_PROXY_SCHEMES:
             proxy_session = self._socks_session(node.url, timeout)
             async with proxy_session.get(
@@ -1131,7 +1566,7 @@ class WebRequestController:
                 return WebResponse(
                     url=url,
                     status=response.status,
-                    headers=dict(response.headers),
+                    headers=self._response_headers(response.headers),
                     body=body,
                     proxy=redact_proxy_url(node.url),
                 )
@@ -1149,7 +1584,7 @@ class WebRequestController:
             return WebResponse(
                 url=url,
                 status=response.status,
-                headers=dict(response.headers),
+                headers=self._response_headers(response.headers),
                 body=body,
                 proxy=redact_proxy_url(node.url),
             )
@@ -1175,13 +1610,13 @@ class WebRequestController:
                 proxies=proxies,
                 allow_redirects=allow_redirects,
                 timeout=total_timeout,
-                verify=True,
+                verify=self.verify_tls,
             )
             body = r.content if isinstance(r.content, bytes) else (r.content or b"")
             return WebResponse(
                 url=url,
                 status=r.status_code,
-                headers=dict(r.headers),
+                headers=self._response_headers(dict(r.headers)),
                 body=body,
                 proxy=redact_proxy_url(node.url),
             )
@@ -1235,9 +1670,30 @@ def resolve_target(value: str) -> Target:
         raise SystemExit(f"No address records for {value!r}")
     family, _, _, _, sockaddr = info[0]
     return Target(original=value, address=sockaddr[0], family=family)
+def should_defer_target_resolution(args: argparse.Namespace) -> bool:
+    """Avoid local DNS when web-only traffic is routed by a proxy/Tor egress."""
+    return bool(
+        getattr(args, "web_only", False)
+        and (
+            getattr(args, "web_tor", False)
+            or getattr(args, "egress_config", None)
+            or getattr(args, "web_proxy", None)
+            or getattr(args, "web_proxy_file", None)
+        )
+    )
+def target_from_args(args: argparse.Namespace) -> Target:
+    if should_defer_target_resolution(args):
+        return Target(original=args.target, address=args.target, family=socket.AF_UNSPEC)
+    return resolve_target(args.target)
+def get_top_ports(limit: int = DEFAULT_TOP_PORTS_COUNT) -> list[int]:
+    if not 1 <= limit <= 65535:
+        raise SystemExit("--top-ports-count must be between 1 and 65535")
+    if len(TOP_PORTS) < limit:
+        raise SystemExit(f"Built-in top-port table only contains {len(TOP_PORTS)} ports")
+    return TOP_PORTS[:limit]
 def parse_ports(args: argparse.Namespace) -> list[int]:
     if getattr(args, "top_ports", False):
-        return TOP_PORTS
+        return get_top_ports(getattr(args, "top_ports_count", DEFAULT_TOP_PORTS_COUNT))
     if getattr(args, "ports", None):
         ports: set[int] = set()
         for chunk in args.ports.split(","):
@@ -1374,9 +1830,19 @@ class _UdpProbeProtocol(asyncio.DatagramProtocol):
         if not self.response.done():
             self.response.set_exception(exc)
 class UdpScanner:
-    def __init__(self, target: Target, timeout: float = DEFAULT_UDP_TIMEOUT) -> None:
+    def __init__(
+        self,
+        target: Target,
+        timeout: float = DEFAULT_UDP_TIMEOUT,
+        include_syslog: bool = False,
+    ) -> None:
         self.target = target
         self.timeout = timeout
+        self.ports = UDP_SCAN_PORTS + (UDP_OPTIONAL_PORTS if include_syslog else ())
+    @staticmethod
+    def _payload_for_port(port: int) -> bytes:
+        payload = UDP_PROBES[port]
+        return payload() if callable(payload) else payload
     async def _probe(self, port: int) -> ServiceResult | None:
         loop = asyncio.get_running_loop()
         transport = None
@@ -1386,7 +1852,7 @@ class UdpScanner:
                 remote_addr=(self.target.address, port),
                 family=self.target.family,
             )
-            transport.sendto(UDP_PROBES[port])
+            transport.sendto(self._payload_for_port(port))
             raw = await asyncio.wait_for(protocol.response, timeout=self.timeout)
         except (OSError, asyncio.TimeoutError):
             return None
@@ -1404,10 +1870,10 @@ class UdpScanner:
     async def scan(self) -> dict[int, ServiceResult]:
         print_stage(
             "UDP Scan",
-            f"Ports: {', '.join(str(p) for p in UDP_SCAN_PORTS)} | Timeout: {self.timeout:.2f}s",
+            f"Ports: {', '.join(str(p) for p in self.ports)} | Timeout: {self.timeout:.2f}s",
         )
         results = await asyncio.gather(
-            *(self._probe(port) for port in UDP_SCAN_PORTS), return_exceptions=True
+            *(self._probe(port) for port in self.ports), return_exceptions=True
         )
         open_udp: dict[int, ServiceResult] = {}
         for item in results:
@@ -1421,7 +1887,7 @@ class SynScanner:
         self.target = target
         self.timeout = timeout
         self.retry = retry
-        self.batch_size = batch_size
+        self.batch_size = max(1, min(int(batch_size), SYN_MAX_BATCH_SIZE))
         self.os_hints: dict[int, str] = {}
     def _layer(self):
         return (
@@ -1499,7 +1965,7 @@ class CveLookup:
     def __init__(self, enabled: bool, concurrency: int = 3) -> None:
         self.enabled = enabled
         self.semaphore = asyncio.Semaphore(concurrency)
-        self.cache: dict[str, list[dict[str, str]]] = {}
+        self.cache: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
         self._api_key = os.getenv("NVD_API_KEY")
         self._client = None
         if Throttler is not None:
@@ -1515,6 +1981,12 @@ class CveLookup:
         if self._client is None and httpx is not None:
             self._client = httpx.AsyncClient(timeout=8)
         return self._client
+    def _cache_store(self, key: str, value: list[dict[str, str]]) -> None:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        while len(self.cache) > MAX_CVE_CACHE_ENTRIES:
+            self.cache.popitem(last=False)
     async def aclose(self) -> None:
         if self._client is None:
             return
@@ -1555,10 +2027,10 @@ class CveLookup:
         if not product_name or not product_version:
             return None
         normalized = product_name.lower().replace("_", " ").replace("/", " ").strip()
+        allowed_products = CPE_SERVICE_PRODUCTS.get(service.lower())
+        if allowed_products is None or normalized not in allowed_products:
+            return None
         mapped = CPE_PRODUCT_MAP.get(normalized)
-        if mapped is None and service in {"http", "https"}:
-            first_token = normalized.split()[0] if normalized.split() else ""
-            mapped = CPE_PRODUCT_MAP.get(first_token)
         if mapped is None:
             return None
         vendor, product = mapped
@@ -1570,6 +2042,7 @@ class CveLookup:
         if not virtual_match:
             return []
         if virtual_match in self.cache:
+            self.cache.move_to_end(virtual_match)
             return self.cache[virtual_match]
         params = {"virtualMatchString": virtual_match, "resultsPerPage": MAX_CVE_RESULTS_PER_QUERY}
         client = self._http_client()
@@ -1583,11 +2056,11 @@ class CveLookup:
                 else:
                     response = await client.get(self.NVD_API, params=params, headers=self._api_headers())
                 if response.status_code != 200:
-                    self.cache[virtual_match] = []
+                    self._cache_store(virtual_match, [])
                     return []
                 payload = response.json()
             except (httpx.HTTPError, asyncio.TimeoutError, ValueError):
-                self.cache[virtual_match] = []
+                self._cache_store(virtual_match, [])
                 return []
         findings = []
         for item in payload.get("vulnerabilities", []):
@@ -1605,7 +2078,7 @@ class CveLookup:
                 "severity": severity,
                 "description": description[:MAX_CVE_DESCRIPTION_LENGTH],
             })
-        self.cache[virtual_match] = findings
+        self._cache_store(virtual_match, findings)
         return findings
 # --------------------------------------------------------------------------
 # Service detector
@@ -1637,6 +2110,7 @@ class ServiceDetector:
         cve_lookup: CveLookup,
         web_controller: WebRequestController | None = None,
         web_only: bool = False,
+        verify_tls: bool = True,
     ) -> None:
         self.target = target
         self.concurrency = concurrency
@@ -1645,6 +2119,7 @@ class ServiceDetector:
         self.cve_lookup = cve_lookup
         self.web_controller = web_controller
         self.web_only = web_only
+        self.verify_tls = verify_tls
     def _host_header(self, port: int) -> str:
         if ":" in self.target.original and not self.target.original.startswith("["):
             host = f"[{self.target.original}]"
@@ -1694,8 +2169,142 @@ class ServiceDetector:
         text = body.decode("utf-8", errors="ignore")
         title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
         return re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else None
+    @staticmethod
+    def _subject_part(value: tuple, key: str) -> str | None:
+        for group in value or ():
+            for name, item in group:
+                if name == key:
+                    return str(item)
+        return None
+    @staticmethod
+    def _cert_time(value: str | None) -> str | None:
+        if not value:
+            return None
+        try:
+            epoch = ssl.cert_time_to_seconds(value)
+        except (TypeError, ValueError):
+            return value
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+    @classmethod
+    def _format_certificate(cls, cert: dict[str, Any], ssl_obj: ssl.SSLObject | None) -> dict[str, Any]:
+        if not cert:
+            return {}
+        san = [
+            item
+            for name, item in cert.get("subjectAltName", ())
+            if str(name).lower() == "dns"
+        ]
+        not_after_raw = cert.get("notAfter")
+        expires_at = cls._cert_time(not_after_raw)
+        days_until_expiry = None
+        expired = None
+        if not_after_raw:
+            try:
+                expires_epoch = ssl.cert_time_to_seconds(not_after_raw)
+                days_until_expiry = int((expires_epoch - time.time()) // 86400)
+                expired = days_until_expiry < 0
+            except (TypeError, ValueError):
+                pass
+        cipher = ssl_obj.cipher() if ssl_obj is not None else None
+        return {
+            "subject_cn": cls._subject_part(cert.get("subject", ()), "commonName"),
+            "issuer_cn": cls._subject_part(cert.get("issuer", ()), "commonName"),
+            "not_before": cls._cert_time(cert.get("notBefore")),
+            "not_after": expires_at,
+            "days_until_expiry": days_until_expiry,
+            "expired": expired,
+            "subject_alt_names": san[:20],
+            "cipher": cipher[0] if cipher else None,
+            "tls_version": cipher[1] if cipher else None,
+            "alpn": ssl_obj.selected_alpn_protocol() if ssl_obj is not None else None,
+        }
+    @staticmethod
+    def _analyze_security_headers(headers: dict[str, Any], tls: bool) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        lower = {str(k).lower(): str(v) for k, v in headers.items() if not isinstance(v, list)}
+        for header in HTTP_SECURITY_HEADERS:
+            value = lower.get(header)
+            if value:
+                continue
+            if header == "strict-transport-security" and not tls:
+                continue
+            findings.append({
+                "name": header,
+                "severity": "LOW",
+                "issue": "missing",
+                "detail": f"{header} header not present",
+            })
+        xcto = lower.get("x-content-type-options", "")
+        if xcto and xcto.lower() != "nosniff":
+            findings.append({
+                "name": "x-content-type-options",
+                "severity": "LOW",
+                "issue": "weak_value",
+                "detail": f"expected nosniff, got {xcto}",
+            })
+        hsts = lower.get("strict-transport-security", "")
+        if tls and hsts:
+            max_age_match = re.search(r"max-age=(\d+)", hsts, re.IGNORECASE)
+            if not max_age_match or int(max_age_match.group(1)) < 15_552_000:
+                findings.append({
+                    "name": "strict-transport-security",
+                    "severity": "LOW",
+                    "issue": "short_max_age",
+                    "detail": "HSTS max-age is missing or shorter than 180 days",
+                })
+        return findings
+    @staticmethod
+    def _analyze_cookie_flags(headers: dict[str, Any], tls: bool) -> list[dict[str, Any]]:
+        raw_values = headers.get("set-cookie-list") or headers.get("set-cookie") or headers.get("Set-Cookie") or ""
+        if not raw_values:
+            return []
+        values = raw_values if isinstance(raw_values, list) else [str(raw_values)]
+        findings: list[dict[str, Any]] = []
+        for value in values:
+            cookie_parts = [part.strip() for part in str(value).split(";") if part.strip()]
+            if not cookie_parts:
+                continue
+            name = cookie_parts[0].split("=", 1)[0]
+            attrs = {part.lower() for part in cookie_parts[1:]}
+            issues: list[str] = []
+            if "httponly" not in attrs:
+                issues.append("missing HttpOnly")
+            if tls and "secure" not in attrs:
+                issues.append("missing Secure")
+            if not any(attr.startswith("samesite") for attr in attrs):
+                issues.append("missing SameSite")
+            if issues:
+                findings.append({
+                    "name": name,
+                    "severity": "LOW",
+                    "issues": issues,
+                })
+        return findings
+    @staticmethod
+    def _cors_findings_from_headers(headers: dict[str, Any]) -> list[dict[str, Any]]:
+        lower = {str(k).lower(): str(v) for k, v in headers.items() if not isinstance(v, list)}
+        acao = lower.get("access-control-allow-origin", "").strip()
+        if not acao:
+            return []
+        allow_credentials = lower.get("access-control-allow-credentials", "").lower() == "true"
+        if acao == "*" or acao == CORS_TEST_ORIGIN:
+            severity = "HIGH" if allow_credentials else "MEDIUM"
+            return [{
+                "severity": severity,
+                "allow_origin": acao,
+                "allow_credentials": allow_credentials,
+                "detail": "CORS policy reflects or broadly allows an untrusted Origin",
+            }]
+        return []
+    def _base_url_for_result(self, result: ServiceResult) -> str:
+        scheme = result.service
+        host = self.target.original
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = host if result.port in {80, 443} else f"{host}:{result.port}"
+        return f"{scheme}://{netloc}"
     def _result_from_web_response(self, port: int, tls: bool, response: WebResponse) -> ServiceResult:
-        headers = {k.lower(): v for k, v in response.headers.items()}
+        headers = {str(k).lower(): v for k, v in response.headers.items()}
         server = headers.get("server") or headers.get("x-powered-by") or "HTTP service"
         scheme = "https" if tls else "http"
         notes = []
@@ -1715,12 +2324,15 @@ class ServiceDetector:
             title=self._extract_title(response.body),
             headers=headers,
             waf=self._detect_waf(headers),
+            security_headers=self._analyze_security_headers(headers, tls),
+            cookie_findings=self._analyze_cookie_flags(headers, tls),
             notes=notes,
         )
     @classmethod
-    def _detect_waf(cls, headers: dict[str, str]) -> str | None:
+    def _detect_waf(cls, headers: dict[str, Any]) -> str | None:
         pairs = [f"{k}: {v}" for k, v in headers.items()]
-        haystack = "\n".join([*headers.keys(), *headers.values(), *pairs]).lower()
+        values = [str(value) for value in headers.values()]
+        haystack = "\n".join([*headers.keys(), *values, *pairs]).lower()
         for name, signatures in cls.WAF_SIGNATURES.items():
             if any(sig in haystack for sig in signatures):
                 return name
@@ -1731,11 +2343,14 @@ class ServiceDetector:
         )
     async def _open_tls(self, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         context = ssl.create_default_context()
-        target_is_ip = looks_like_ip(self.target.original)
-        server_hostname = None if target_is_ip else self.target.original
-        if target_is_ip:
+        if not self.verify_tls or looks_like_ip(self.target.original):
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
+        try:
+            context.set_alpn_protocols(["h2", "http/1.1"])
+        except NotImplementedError:
+            pass
+        server_hostname = self.target.original
         return await asyncio.wait_for(
             asyncio.open_connection(
                 self.target.address, port, ssl=context, server_hostname=server_hostname
@@ -1743,7 +2358,7 @@ class ServiceDetector:
             timeout=self.timeout,
         )
     def _request_ssl_policy(self):
-        return False if looks_like_ip(self.target.original) else None
+        return None if self.verify_tls else False
     @staticmethod
     def _port_hint_result(port: int, prior: ServiceResult) -> ServiceResult | None:
         hint = LOW_CONFIDENCE_PORT_HINTS.get(port)
@@ -1803,7 +2418,10 @@ class ServiceDetector:
             return ServiceResult(
                 port=port, service=scheme, version=server, tls=tls,
                 http_status=status, title=title, headers=headers,
-                waf=self._detect_waf(headers), notes=notes,
+                waf=self._detect_waf(headers),
+                security_headers=self._analyze_security_headers(headers, tls),
+                cookie_findings=self._analyze_cookie_flags(headers, tls),
+                notes=notes,
             )
         except (OSError, ssl.SSLError, asyncio.TimeoutError):
             return None
@@ -1886,12 +2504,7 @@ class ServiceDetector:
             return []
         if self.web_controller is None or aiohttp is None:
             return []
-        scheme = result.service
-        host = self.target.original
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        netloc = host if result.port in {80, 443} else f"{host}:{result.port}"
-        base_url = f"{scheme}://{netloc}"
+        base_url = self._base_url_for_result(result)
         findings: list[WebFinding] = []
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async def fetch_path(path: str) -> WebFinding | None:
@@ -1920,10 +2533,91 @@ class ServiceDetector:
             if isinstance(item, WebFinding):
                 findings.append(item)
         return findings
+    async def _check_api_paths(self, result: ServiceResult, session) -> list[WebFinding]:
+        if not self.check_sensitive_paths or result.service not in {"http", "https"}:
+            return []
+        if self.web_controller is None or aiohttp is None:
+            return []
+        base_url = self._base_url_for_result(result)
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        useful_statuses = {200, 201, 204, 301, 302, 307, 308, 401, 405}
+        async def fetch_path(path: str) -> WebFinding | None:
+            response = await self.web_controller.request(
+                session=session,
+                url=base_url + path,
+                timeout=timeout,
+                ssl_policy=self._request_ssl_policy(),
+                allow_redirects=False,
+                block_on_ban=False,
+            )
+            if response is None or response.status not in useful_statuses:
+                return None
+            return WebFinding(
+                path=path,
+                status=response.status,
+                size=len(response.body),
+                content_type=response.headers.get("content-type", ""),
+            )
+        path_results = await asyncio.gather(
+            *(fetch_path(path) for path in API_DISCOVERY_PATHS),
+            return_exceptions=True,
+        )
+        return [item for item in path_results if isinstance(item, WebFinding)]
+    async def _check_cors(self, result: ServiceResult, session) -> list[dict[str, Any]]:
+        if not self.check_sensitive_paths or result.service not in {"http", "https"}:
+            return []
+        if self.web_controller is None or aiohttp is None:
+            return []
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        response = await self.web_controller.request(
+            session=session,
+            url=self._base_url_for_result(result) + "/",
+            timeout=timeout,
+            ssl_policy=self._request_ssl_policy(),
+            allow_redirects=False,
+            extra_headers={"Origin": CORS_TEST_ORIGIN},
+            block_on_ban=False,
+        )
+        if response is None:
+            return []
+        headers = {k.lower(): v for k, v in response.headers.items()}
+        return self._cors_findings_from_headers(headers)
+    async def _probe_tls_certificate(self, port: int) -> dict[str, Any]:
+        if self.web_controller is not None and self.web_controller.uses_proxy:
+            return {"skipped": "direct TLS certificate probe disabled while proxy egress is active"}
+        if self.target.family == socket.AF_UNSPEC:
+            return {"skipped": "target resolution deferred"}
+        reader = writer = None
+        try:
+            reader, writer = await self._open_tls(port)
+            ssl_obj = writer.get_extra_info("ssl_object")
+            cert = ssl_obj.getpeercert() if ssl_obj is not None else {}
+            return self._format_certificate(cert, ssl_obj)
+        except (OSError, ssl.SSLError, asyncio.TimeoutError) as exc:
+            return {"error": str(exc)[:160]}
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+    async def _run_web_checks(self, result: ServiceResult, session) -> None:
+        if result.tls:
+            result.tls_certificate = await self._probe_tls_certificate(result.port)
+            if result.tls_certificate.get("alpn") == "h2":
+                result.notes.append("HTTP/2 supported")
+        if result.service not in {"http", "https"}:
+            return
+        result.sensitive_paths = await self._check_sensitive_paths(result, session)
+        result.api_paths = await self._check_api_paths(result, session)
+        result.cors_findings = await self._check_cors(result, session)
     async def detect_one(self, port: int, semaphore: asyncio.Semaphore, session) -> ServiceResult:
         async with semaphore:
             result: ServiceResult | None = None
-            result = await self._first_successful_http_probe(port, session)
+            prefer_http = self.web_only or port in WEB_PORT_HINTS or port in TLS_PORT_HINTS
+            if prefer_http:
+                result = await self._first_successful_http_probe(port, session)
             if self.web_only:
                 if result is None:
                     return ServiceResult(
@@ -1932,16 +2626,16 @@ class ServiceDetector:
                         version="web probe failed",
                         notes=["Web-only mode skipped direct TCP fallback probes"],
                     )
-                result.sensitive_paths = await self._check_sensitive_paths(result, session)
+                await self._run_web_checks(result, session)
                 result.cves = await self.cve_lookup.query(result.service, result.version, session)
                 return result
             if result is None:
                 result = await self._probe_known_greeting(port)
-            if result.service == "unknown" and port in WEB_PORT_HINTS:
+            if result.service == "unknown" and not prefer_http and port in WEB_PORT_HINTS:
                 fallback = await self._probe_http_via_session(port, tls=False, session=session)
                 if fallback is not None:
                     result = fallback
-            if result.service == "unknown" and port not in TLS_PORT_HINTS:
+            if result.service == "unknown" and not prefer_http and port not in TLS_PORT_HINTS:
                 tls_result = await self._probe_http_via_session(port, tls=True, session=session)
                 if tls_result is not None:
                     result = tls_result
@@ -1959,7 +2653,7 @@ class ServiceDetector:
                 hinted = self._port_hint_result(port, result)
                 if hinted is not None:
                     result = hinted
-            result.sensitive_paths = await self._check_sensitive_paths(result, session)
+            await self._run_web_checks(result, session)
             result.cves = await self.cve_lookup.query(result.service, result.version, session)
             return result
     async def detect(self, ports: list[int]) -> dict[int, ServiceResult]:
@@ -2025,17 +2719,17 @@ def print_banner() -> None:
     print(
         Fore.RED + Style.BRIGHT
         + r"""
-  ____ ____  ___ __  __ ____   ___  _   _
- / ___|  _ \|_ _|  \/  / ___| / _ \| \ | |
-| |   | |_) || || |\/| \___ \| | | |  \| |
-| |___|  _ < | || |  | |___) | |_| | |\  |
- \____|_| \_\___|_|  |_|____/ \___/|_| \_|
+  ____ ____  ___ __  __ ____   ___  _   ___        _______ ____
+ / ___|  _ \|_ _|  \/  / ___| / _ \| \ | \ \      / / ____| __ )
+| |   | |_) || || |\/| \___ \| | | |  \| |\ \ /\ / /|  _| |  _ \
+| |___|  _ < | || |  | |___) | |_| | |\  | \ V  V / | |___| |_) |
+ \____|_| \_\___|_|  |_|____/ \___/|_| \_|  \_/\_/  |_____|____/
 """
         + Style.RESET_ALL
     )
     print(Fore.LIGHTBLACK_EX + "  " + "-" * 70)
-    print(Fore.WHITE + Style.BRIGHT + f"  Crimson Core v{APP_VERSION} | Authorized Adversary-Emulation Scanner")
-    print(Fore.RED + "  Multi-egress | ban-aware | adaptive pacing | audit logged")
+    print(Fore.WHITE + Style.BRIGHT + f"  CrimsonWeb v{APP_VERSION} | Authorized Web & Service Scanner")
+    print(Fore.RED + "  multi-egress | ban-aware | adaptive pacing | audit logged")
     print(Fore.LIGHTBLACK_EX + "  " + "-" * 70 + "\n")
 def print_stage(title: str, detail: str = "") -> None:
     line = "=" * 78
@@ -2061,7 +2755,7 @@ def result_color(result: ServiceResult) -> str:
         return Fore.GREEN
     if result.service in {"ssh", "smtp", "ftp", "mysql", "pop3", "imap/pop"}:
         return Fore.CYAN
-    if result.cves or result.sensitive_paths:
+    if result.cves or result.sensitive_paths or result.api_paths or result.security_headers or result.cookie_findings or result.cors_findings:
         return Fore.YELLOW
     return Fore.WHITE
 # --------------------------------------------------------------------------
@@ -2069,13 +2763,23 @@ def result_color(result: ServiceResult) -> str:
 # --------------------------------------------------------------------------
 def _severity_rank(sev: str) -> int:
     return {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}.get(sev.upper(), 4)
+def _web_finding_count(result: ServiceResult) -> int:
+    return (
+        len(result.sensitive_paths)
+        + len(result.api_paths)
+        + len(result.security_headers)
+        + len(result.cookie_findings)
+        + len(result.cors_findings)
+    )
 def _max_severity(results: dict[int, ServiceResult]) -> str:
     severities = []
     for result in results.values():
         for cve in result.cves:
             severities.append(cve.get("severity", "unknown"))
+        for finding in result.cors_findings + result.security_headers + result.cookie_findings:
+            severities.append(str(finding.get("severity", "LOW")))
     if not severities:
-        return "LOW" if any(r.sensitive_paths for r in results.values()) else "INFO"
+        return "LOW" if any(_web_finding_count(r) for r in results.values()) else "INFO"
     severities.sort(key=_severity_rank)
     return severities[0].upper()
 def write_executive_report(
@@ -2090,6 +2794,8 @@ def write_executive_report(
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     total_cves = sum(len(r.cves) for r in results.values())
     total_sensitive = sum(len(r.sensitive_paths) for r in results.values())
+    total_api = sum(len(r.api_paths) for r in results.values())
+    total_web_findings = sum(_web_finding_count(r) for r in results.values())
     open_count = len(results)
     max_sev = _max_severity(results)
     risk_label = {
@@ -2100,7 +2806,7 @@ def write_executive_report(
         "INFO": "Informational",
     }.get(max_sev, "Unknown")
     lines: list[str] = []
-    lines.append(f"# Crimson Scan Report — {target.original}")
+    lines.append(f"# CrimsonWeb Scan Report — {target.original}")
     lines.append("")
     lines.append(f"- **Scan time (UTC):** {timestamp}")
     lines.append(f"- **Target:** `{target.original}` (`{target.address}`)")
@@ -2114,7 +2820,9 @@ def write_executive_report(
     lines.append(
         f"Scan identified **{open_count}** open service(s), "
         f"**{total_cves}** potential CVE match(es), "
-        f"**{total_sensitive}** sensitive path exposure(s). "
+        f"**{total_sensitive}** sensitive path exposure(s), "
+        f"**{total_api}** API endpoint indicator(s), "
+        f"**{total_web_findings}** total web hardening finding(s). "
         f"Overall risk: **{risk_label}**."
     )
     lines.append("")
@@ -2134,6 +2842,8 @@ def write_executive_report(
     lines.append("- Port discovery (async-connect / SYN as configured)")
     lines.append("- Service fingerprinting via banner grabbing and protocol probes")
     lines.append("- Passive WAF/header analysis")
+    lines.append("- HTTP security header, cookie flag, CORS and API path checks")
+    lines.append("- TLS certificate metadata collection when safe for the configured egress")
     lines.append("- Sensitive path enumeration (limited list)")
     lines.append("- NVD CVE correlation by detected version")
     lines.append("- Multi-egress traffic with ban-aware backoff and adaptive pacing")
@@ -2142,13 +2852,13 @@ def write_executive_report(
     lines.append("")
     lines.append("## Findings")
     lines.append("")
-    if not any(r.cves or r.sensitive_paths for r in results.values()):
-        lines.append("_No CVE matches or sensitive-path exposures identified._")
+    if not any(r.cves or _web_finding_count(r) for r in results.values()):
+        lines.append("_No CVE matches or web hardening findings identified._")
         lines.append("")
     else:
         for port in sorted(results):
             result = results[port]
-            if not (result.cves or result.sensitive_paths):
+            if not (result.cves or _web_finding_count(result)):
                 continue
             lines.append(f"### Port {port}/{result.transport} — {result.service}")
             lines.append("")
@@ -2161,6 +2871,42 @@ def write_executive_report(
                 lines.append("- **Sensitive paths exposed:**")
                 for finding in result.sensitive_paths:
                     lines.append(f"    - `{finding.path}` (status={finding.status}, size={finding.size})")
+            if result.api_paths:
+                lines.append("- **API endpoint indicators:**")
+                for finding in result.api_paths:
+                    lines.append(f"    - `{finding.path}` (status={finding.status}, size={finding.size})")
+            if result.security_headers:
+                lines.append("- **Security header findings:**")
+                for finding in result.security_headers:
+                    lines.append(f"    - `{finding.get('name')}`: {finding.get('detail')}")
+            if result.cookie_findings:
+                lines.append("- **Cookie flag findings:**")
+                for finding in result.cookie_findings:
+                    lines.append(
+                        f"    - `{finding.get('name')}`: {', '.join(finding.get('issues', []))}"
+                    )
+            if result.cors_findings:
+                lines.append("- **CORS findings:**")
+                for finding in result.cors_findings:
+                    lines.append(
+                        f"    - {finding.get('severity')}: {finding.get('detail')} "
+                        f"(ACAO={finding.get('allow_origin')})"
+                    )
+            if result.tls_certificate:
+                cert = result.tls_certificate
+                lines.append("- **TLS certificate:**")
+                lines.append(
+                    f"    - subject={cert.get('subject_cn') or '-'}, "
+                    f"issuer={cert.get('issuer_cn') or '-'}, "
+                    f"expires={cert.get('not_after') or '-'}"
+                )
+            if result.mitre_attack:
+                lines.append("- **MITRE ATT&CK mapping:**")
+                for mapping in result.mitre_attack:
+                    lines.append(
+                        f"    - `{mapping.get('id')}` {mapping.get('technique')}: "
+                        f"{mapping.get('reason')}"
+                    )
             if result.cves:
                 lines.append("- **Potential CVEs:**")
                 for cve in result.cves:
@@ -2170,6 +2916,20 @@ def write_executive_report(
             lines.append("**Remediation:** Upgrade to a patched release, restrict exposure where possible, ")
             lines.append("monitor logs for exploitation attempts. Verify with vendor advisories.")
             lines.append("")
+    lines.append("## MITRE ATT&CK Summary")
+    lines.append("")
+    unique_mitre: OrderedDict[str, dict[str, str]] = OrderedDict()
+    for result in results.values():
+        for mapping in result.mitre_attack:
+            unique_mitre.setdefault(mapping.get("id", "unknown"), mapping)
+    if not unique_mitre:
+        lines.append("_No ATT&CK mappings generated._")
+    else:
+        for mapping in unique_mitre.values():
+            lines.append(
+                f"- `{mapping.get('id')}` **{mapping.get('technique')}**: {mapping.get('reason')}"
+            )
+    lines.append("")
     lines.append("## Egress & Behavioral Log Summary")
     lines.append("")
     egress = web_policy.get("egress", {})
@@ -2198,8 +2958,9 @@ def write_executive_report(
 # --------------------------------------------------------------------------
 class BlueScanner:
     def __init__(self, args: argparse.Namespace) -> None:
+        apply_runtime_profile(args)
         self.args = args
-        self.target = resolve_target(args.target)
+        self.target = target_from_args(args)
         self.ports = parse_ports(args)
         self.scan_mode = self._select_scan_mode()
         self.state_path = self._resolve_state_path()
@@ -2224,6 +2985,7 @@ class BlueScanner:
             max_retries=args.web_max_retries,
             user_agent=args.user_agent,
             fingerprint=args.fingerprint,
+            verify_tls=not args.tls_no_verify,
             state=self.state,
             state_path=self.state_path,
         )
@@ -2256,11 +3018,20 @@ class BlueScanner:
         """If state has no recon paths, run passive recon now."""
         if self.args.no_recon:
             return
+        if self.args.decoy_rate <= 0.0:
+            return
         if self.state.discovered_decoy_paths:
             return
         for scheme in ("https", "http"):
             url = f"{scheme}://{self.target.original}/"
-            paths = await passive_recon(url, timeout=5.0)
+            controller = self.web_controller if self.web_controller.uses_proxy else None
+            paths = await passive_recon(
+                url,
+                timeout=5.0,
+                web_controller=controller,
+                verify_tls=not self.args.tls_no_verify,
+                max_links=self.args.recon_max_links,
+            )
             if paths:
                 self.state.add_decoy_paths(paths)
                 save_state(self.state, self.state_path)
@@ -2294,7 +3065,8 @@ class BlueScanner:
                 f"Global cap: {self.web_controller.pacer.max_global_rate} req/min | "
                 f"Decoy rate: {self.web_controller.decoy.rate:.2f}",
             )
-        await self._maybe_recon_decoys()
+        if not self.args.port_scan_only:
+            await self._maybe_recon_decoys()
         if self.scan_mode == "web-only":
             open_ports = self.ports
             os_hints: dict[int, str] = {}
@@ -2314,27 +3086,44 @@ class BlueScanner:
             audit_event("scan_no_open_ports")
             return 0
         results: dict[int, ServiceResult] = {}
-        cve_lookup = CveLookup(enabled=not self.args.no_cve)
-        try:
-            detector = ServiceDetector(
-                self.target,
-                concurrency=self.args.service_concurrency,
-                timeout=self.args.banner_timeout,
-                check_sensitive_paths=not self.args.no_web_checks,
-                cve_lookup=cve_lookup,
-                web_controller=self.web_controller,
-                web_only=self.args.web_only,
-            )
-            if open_ports:
-                results = await detector.detect(open_ports)
-        finally:
-            await cve_lookup.aclose()
+        if self.args.port_scan_only:
+            results = {
+                port: ServiceResult(
+                    port=port,
+                    service="unknown",
+                    version="open, fingerprinting skipped",
+                    notes=["Port scan only mode"],
+                )
+                for port in open_ports
+            }
             await self.web_controller.aclose()
+        else:
+            cve_lookup = CveLookup(enabled=not self.args.no_cve)
+            try:
+                detector = ServiceDetector(
+                    self.target,
+                    concurrency=self.args.service_concurrency,
+                    timeout=self.args.banner_timeout,
+                    check_sensitive_paths=not self.args.no_web_checks,
+                    cve_lookup=cve_lookup,
+                    web_controller=self.web_controller,
+                    web_only=self.args.web_only,
+                    verify_tls=not self.args.tls_no_verify,
+                )
+                if open_ports:
+                    results = await detector.detect(open_ports)
+            finally:
+                await cve_lookup.aclose()
+                await self.web_controller.aclose()
         for port, hint in os_hints.items():
             if port in results:
                 results[port].os_hint = hint
         if self.args.udp:
-            udp_results = await UdpScanner(self.target, timeout=self.args.udp_timeout).scan()
+            udp_results = await UdpScanner(
+                self.target,
+                timeout=self.args.udp_timeout,
+                include_syslog=self.args.udp_include_syslog,
+            ).scan()
             for port, udp_result in udp_results.items():
                 if port in results:
                     results[port].notes.append(f"UDP {udp_result.service}: {udp_result.version}")
@@ -2343,6 +3132,8 @@ class BlueScanner:
         if not results:
             print(Fore.YELLOW + "No open TCP ports or UDP responders found.")
             return 0
+        for result in results.values():
+            result.mitre_attack = mitre_mappings_for_result(result)
         self._print_results(results)
         self._print_web_blocks()
         if self.args.compare:
@@ -2399,6 +3190,8 @@ class BlueScanner:
         print(Fore.CYAN + "-" * 120)
         total_cves = 0
         total_sensitive = 0
+        total_api = 0
+        total_web_hardening = 0
         web_services = 0
         for port in sorted(results):
             result = results[port]
@@ -2407,8 +3200,23 @@ class BlueScanner:
                 findings.append(f"WAF={result.waf}")
             if result.sensitive_paths:
                 findings.append(f"files={len(result.sensitive_paths)}")
+            if result.api_paths:
+                findings.append(f"api={len(result.api_paths)}")
+            if result.security_headers:
+                findings.append(f"headers={len(result.security_headers)}")
+            if result.cookie_findings:
+                findings.append(f"cookies={len(result.cookie_findings)}")
+            if result.cors_findings:
+                findings.append(f"cors={len(result.cors_findings)}")
+            if result.mitre_attack:
+                findings.append(f"mitre={len(result.mitre_attack)}")
             if result.cves:
                 findings.append(f"cves={len(result.cves)}")
+            if result.tls_certificate:
+                if result.tls_certificate.get("days_until_expiry") is not None:
+                    findings.append(f"cert={result.tls_certificate.get('days_until_expiry')}d")
+                elif result.tls_certificate.get("skipped"):
+                    findings.append("cert=skipped")
             if result.os_hint:
                 findings.append(f"os={result.os_hint}")
             if result.http_status is not None:
@@ -2417,6 +3225,8 @@ class BlueScanner:
                 findings.append(f"title={trim_text(result.title, 22)}")
             total_cves += len(result.cves)
             total_sensitive += len(result.sensitive_paths)
+            total_api += len(result.api_paths)
+            total_web_hardening += _web_finding_count(result)
             if result.service in {"http", "https"}:
                 web_services += 1
             color = result_color(result)
@@ -2431,7 +3241,8 @@ class BlueScanner:
         print(
             Fore.WHITE + Style.BRIGHT
             + f"Summary: {len(results)} open port(s) | {web_services} web service(s) | "
-            + f"{total_sensitive} sensitive path hit(s) | {total_cves} CVE match(es)"
+            + f"{total_sensitive} sensitive path hit(s) | {total_api} API indicator(s) | "
+            + f"{total_web_hardening} web finding(s) | {total_cves} CVE match(es)"
         )
         print(Fore.CYAN + "=" * 120)
     def _print_web_blocks(self) -> None:
@@ -2465,24 +3276,29 @@ class BlueScanner:
                 json.dump(payload, handle, indent=2)
         elif self.args.format == "csv":
             with report_path.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=["port", "service", "version", "cves"])
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["port", "service", "version", "web_findings", "cves"],
+                )
                 writer.writeheader()
                 for result in (results[port] for port in sorted(results)):
                     writer.writerow({
                         "port": result.port,
                         "service": result.service,
                         "version": result.version,
+                        "web_findings": _web_finding_count(result),
                         "cves": ",".join(cve.get("id", "") for cve in result.cves),
                     })
         else:
             with report_path.open("w", encoding="utf-8") as handle:
-                handle.write("| Port | Service | Version | CVEs |\n")
-                handle.write("| --- | --- | --- | --- |\n")
+                handle.write("| Port | Service | Version | Web Findings | CVEs |\n")
+                handle.write("| --- | --- | --- | --- | --- |\n")
                 for result in (results[port] for port in sorted(results)):
                     cves = ", ".join(cve.get("id", "") for cve in result.cves) or "-"
+                    web_findings = str(_web_finding_count(result)) if _web_finding_count(result) else "-"
                     handle.write(
                         f"| {result.port}/{result.transport} | {result.service} | "
-                        f"{result.version.replace('|', '/')} | {cves} |\n"
+                        f"{result.version.replace('|', '/')} | {web_findings} | {cves} |\n"
                     )
         return report_path
     @staticmethod
@@ -2493,21 +3309,37 @@ class BlueScanner:
 # --------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="crimsonweb",
         description=f"{APP_NAME} v{APP_VERSION} — authorized adversary-emulation scanner. "
                     "Use ONLY with a signed RoE.",
+        epilog=(
+            "Examples: "
+            "crimsonweb --roe RoE-REF example.gov.tr --top-ports --fast; "
+            "crimsonweb --r RoE-REF example.gov.tr -p 80,443 --web-only --web-tor"
+        ),
     )
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
     # Required RoE attestation
     parser.add_argument(
+        "--roe",
+        "--r",
         "--roe-confirmed",
+        dest="roe_confirmed",
         required=True,
         help="Mandatory: signed RoE reference (e.g. 'RoE-2026-BLD-001'). "
              "Logged to audit trail.",
     )
-    parser.add_argument("target", help="Target IP or domain")
+    parser.add_argument("target", nargs="?", help="Target IP or domain")
+    parser.add_argument("-t", "--target", dest="target_option",
+                        help="Target IP or domain (tool-style alternative to positional target)")
+    parser.add_argument("-u", "--url", dest="target_url",
+                        help="HTTP/HTTPS URL; host becomes target, default port derives from URL")
     parser.add_argument("-s", "--start", type=int, default=1, help="Start port for range scans")
     parser.add_argument("-e", "--end", type=int, default=65535, help="End port for range scans")
     parser.add_argument("-p", "--ports", help="Comma-separated ports/ranges, e.g.: 22,80,443,8000-8100")
-    parser.add_argument("--top-ports", action="store_true", help="Use the built-in curated top ports list")
+    parser.add_argument("--top-ports", action="store_true", help="Use the ranked top TCP ports list")
+    parser.add_argument("--top-ports-count", type=int, default=DEFAULT_TOP_PORTS_COUNT,
+                        help=f"Number of ranked ports to use with --top-ports (default: {DEFAULT_TOP_PORTS_COUNT})")
     parser.add_argument("--syn", action="store_true", help="Use privileged SYN scanning via Scapy (explicit)")
     parser.add_argument("--timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT)
     parser.add_argument("--banner-timeout", type=float, default=DEFAULT_BANNER_TIMEOUT)
@@ -2515,13 +3347,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--port-concurrency", type=int, default=DEFAULT_PORT_CONCURRENCY)
     parser.add_argument("--service-concurrency", type=int, default=DEFAULT_SERVICE_CONCURRENCY)
+    parser.add_argument("--fast", action="store_true",
+                        help="Fast first-pass profile: shorter timeouts, higher concurrency, no CVE/recon/web path checks")
+    parser.add_argument("--port-scan-only", action="store_true",
+                        help="Only discover open TCP ports; skip service fingerprinting and web checks")
     parser.add_argument("--no-cve", action="store_true")
     parser.add_argument("--no-web-checks", action="store_true")
     parser.add_argument("--no-recon", action="store_true",
                         help="Skip passive recon for decoy path discovery")
+    parser.add_argument("--recon-max-links", type=int, default=RECON_MAX_LINKS,
+                        help=f"Maximum passive recon links to add to decoys (default: {RECON_MAX_LINKS})")
     parser.add_argument("--compare", help="Compare against a previous JSON report")
     parser.add_argument("--output-dir", default=".")
     parser.add_argument("--udp", action="store_true")
+    parser.add_argument("--udp-include-syslog", action="store_true",
+                        help="Include UDP/514 syslog probe; may create SIEM/log entries on the target")
     parser.add_argument("--udp-timeout", type=float, default=DEFAULT_UDP_TIMEOUT)
     parser.add_argument("--format", choices=("json", "csv", "markdown"), default="json")
     parser.add_argument("--web-only", action="store_true",
@@ -2557,19 +3397,72 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--user-agent", help="Fixed User-Agent string")
     parser.add_argument("--fingerprint", choices=tuple(FINGERPRINT_PROFILES),
                         help="TLS fingerprint profile via curl_cffi (optional dep)")
+    parser.add_argument("--tls-no-verify", action="store_true",
+                        help="Disable TLS certificate verification for both aiohttp and curl_cffi paths")
     parser.add_argument("--decoy-rate", type=float, default=DEFAULT_DECOY_RATE,
                         help="Probability of injecting a decoy request (0.0-1.0)")
     # State / resume
     parser.add_argument("--state-file", help="Custom state file path "
-                                             "(default: ~/.crimson/state/<hash>.json)")
+                                             "(default: ~/.crimsonweb/state/<hash>.json)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from prior state if available")
     return parser
+def apply_runtime_profile(args: argparse.Namespace) -> None:
+    if not getattr(args, "fast", False):
+        return
+    if args.timeout == DEFAULT_CONNECT_TIMEOUT:
+        args.timeout = 0.75
+    if args.banner_timeout == DEFAULT_BANNER_TIMEOUT:
+        args.banner_timeout = 1.0
+    if args.port_concurrency == DEFAULT_PORT_CONCURRENCY:
+        args.port_concurrency = 1000
+    if args.service_concurrency == DEFAULT_SERVICE_CONCURRENCY:
+        args.service_concurrency = 100
+    if args.batch_size == 512:
+        args.batch_size = 1024
+    if args.web_request_delay == DEFAULT_WEB_REQUEST_DELAY:
+        args.web_request_delay = 0.0
+    if args.web_sensitive_delay == DEFAULT_WEB_SENSITIVE_DELAY:
+        args.web_sensitive_delay = 0.0
+    if args.web_max_global_rate == DEFAULT_WEB_MAX_GLOBAL_RATE:
+        args.web_max_global_rate = 6000
+    args.no_cve = True
+    args.no_recon = True
+    args.no_web_checks = True
+def normalize_target_args(args: argparse.Namespace) -> None:
+    supplied = [
+        name
+        for name, value in (
+            ("positional target", getattr(args, "target", None)),
+            ("--target", getattr(args, "target_option", None)),
+            ("--url", getattr(args, "target_url", None)),
+        )
+        if value
+    ]
+    if not supplied:
+        raise SystemExit("target is required. Use: crimsonweb <target>, crimsonweb -t <target>, or crimsonweb -u <url>")
+    if len(supplied) > 1:
+        raise SystemExit("Provide only one target form: positional target, --target, or --url")
+    if getattr(args, "target_option", None):
+        args.target = args.target_option.strip()
+        return
+    if getattr(args, "target_url", None):
+        parsed = urlsplit(args.target_url.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise SystemExit("--url must be an http:// or https:// URL")
+        args.target = parsed.hostname
+        if not args.ports and not args.top_ports:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            args.ports = str(port)
+        args.web_only = True
+        return
+    args.target = args.target.strip()
 def validate_args(args: argparse.Namespace) -> None:
+    normalize_target_args(args)
     # RoE format
     if not ROE_REF_PATTERN.match(args.roe_confirmed or ""):
         raise SystemExit(
-            "--roe-confirmed must be a non-empty token of 4–128 chars "
+            "--roe must be a non-empty token of 4–128 chars "
             "(letters, digits, ._-:/)."
         )
     # Egress mutex
@@ -2582,6 +3475,13 @@ def validate_args(args: argparse.Namespace) -> None:
     # Tor flag implications
     if args.web_tor and not args.web_only:
         raise SystemExit("--web-tor requires --web-only (direct TCP discovery would leak your IP)")
+    if args.egress_config and not args.web_only:
+        raise SystemExit(
+            "--egress-config requires --web-only. Run TCP port discovery from the VPS first, "
+            "then run web-only checks through the approved proxy pool."
+        )
+    if (args.web_proxy or args.web_proxy_file) and not args.web_only:
+        raise SystemExit("--web-proxy and --web-proxy-file require --web-only")
     if args.tor_new_identity and not args.web_only:
         raise SystemExit("--tor-new-identity requires --web-only")
     if args.tor_new_identity and not args.web_tor and not (args.web_proxy or "").startswith("socks5"):
@@ -2591,24 +3491,39 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--web-only cannot be combined with --syn")
     if args.web_only and args.udp:
         raise SystemExit("--web-only cannot be combined with --udp")
+    if args.port_scan_only and args.web_only:
+        raise SystemExit("--port-scan-only cannot be combined with --web-only")
+    if args.port_scan_only and args.udp:
+        raise SystemExit("--port-scan-only cannot be combined with --udp")
+    if args.udp_include_syslog and not args.udp:
+        raise SystemExit("--udp-include-syslog requires --udp")
+    if not 1 <= args.top_ports_count <= 65535:
+        raise SystemExit("--top-ports-count must be between 1 and 65535")
     # SYN privilege check
     if args.syn and not has_elevated_privileges():
         raise SystemExit("--syn requires elevated privileges (run as root / Administrator)")
     # Decoy rate range
     if not 0.0 <= args.decoy_rate <= 1.0:
         raise SystemExit("--decoy-rate must be between 0.0 and 1.0")
+    if args.recon_max_links < 0:
+        raise SystemExit("--recon-max-links must be zero or greater")
 def write_roe_attestation(args: argparse.Namespace) -> None:
     """Record RoE attestation as the first audit event."""
     try:
         operator = getpass.getuser()
     except Exception:
         operator = "unknown"
+    sudo_user = os.environ.get("SUDO_USER") or None
+    sudo_uid = os.environ.get("SUDO_UID") or None
     audit_event(
         "roe_attestation",
         operator=operator,
+        sudo_user=sudo_user,
+        sudo_uid=sudo_uid,
+        elevated=has_elevated_privileges(),
         roe_ref=args.roe_confirmed,
         host=socket.gethostname(),
-        cli=" ".join(sys.argv),
+        cli=redact_cli_args(sys.argv),
         version=APP_VERSION,
     )
 # --------------------------------------------------------------------------
@@ -2617,41 +3532,48 @@ def write_roe_attestation(args: argparse.Namespace) -> None:
 def main(argv: Iterable[str] | None = None) -> int:
     colorama_init(autoreset=True)
     args = build_parser().parse_args(argv)
+    apply_runtime_profile(args)
     validate_args(args)
     setup_logging(args.output_dir)
-    write_roe_attestation(args)
-    if AIOHTTP_IMPORT_ERROR is not None:
-        raise SystemExit(
-            f"Missing dependency: {AIOHTTP_IMPORT_ERROR}. "
-            "Install with: pip install -r requirements.txt"
-        )
-    if HTTPX_IMPORT_ERROR is not None and not args.no_cve:
-        raise SystemExit(
-            f"Missing dependency for CVE lookup: {HTTPX_IMPORT_ERROR}. "
-            "Install with: pip install httpx, or pass --no-cve."
-        )
-    if THROTTLE_IMPORT_ERROR is not None and not args.no_cve:
-        logging.warning("asyncio_throttle not installed; CVE rate limiting disabled")
-    if args.web_tor and AIOHTTP_SOCKS_IMPORT_ERROR is not None:
-        raise SystemExit(
-            "aiohttp_socks required for --web-tor. Install: pip install aiohttp-socks"
-        )
-    if args.fingerprint and not CURL_CFFI_AVAILABLE:
-        logging.warning("--fingerprint requested but curl_cffi missing — falling back to aiohttp")
-    if args.tor_new_identity:
-        print(Fore.CYAN + "Requesting new Tor identity before scan...")
-        TorControlClient(
-            host=args.tor_control_host,
-            port=args.tor_control_port,
-            password=args.tor_control_password,
-            cookie_file=args.tor_control_cookie,
-            new_identity_wait=args.tor_new_identity_wait,
-        ).signal_new_identity()
     try:
-        return asyncio.run(BlueScanner(args).run())
-    except KeyboardInterrupt:
-        print("\nScan interrupted.")
-        audit_event("scan_interrupted")
-        return 130
+        write_roe_attestation(args)
+        if args.tls_no_verify:
+            logging.warning("TLS certificate verification disabled by --tls-no-verify")
+            audit_event("tls_verification_disabled")
+        if AIOHTTP_IMPORT_ERROR is not None:
+            raise SystemExit(
+                f"Missing dependency: {AIOHTTP_IMPORT_ERROR}. "
+                "Install with: pip install -r requirements.txt"
+            )
+        if HTTPX_IMPORT_ERROR is not None and not args.no_cve:
+            raise SystemExit(
+                f"Missing dependency for CVE lookup: {HTTPX_IMPORT_ERROR}. "
+                "Install with: pip install httpx, or pass --no-cve."
+            )
+        if THROTTLE_IMPORT_ERROR is not None and not args.no_cve:
+            logging.warning("asyncio_throttle not installed; CVE rate limiting disabled")
+        if args.web_tor and AIOHTTP_SOCKS_IMPORT_ERROR is not None:
+            raise SystemExit(
+                "aiohttp_socks required for --web-tor. Install: pip install aiohttp-socks"
+            )
+        if args.fingerprint and not CURL_CFFI_AVAILABLE:
+            logging.warning("--fingerprint requested but curl_cffi missing - falling back to aiohttp")
+        if args.tor_new_identity:
+            print(Fore.CYAN + "Requesting new Tor identity before scan...")
+            TorControlClient(
+                host=args.tor_control_host,
+                port=args.tor_control_port,
+                password=args.tor_control_password,
+                cookie_file=args.tor_control_cookie,
+                new_identity_wait=args.tor_new_identity_wait,
+            ).signal_new_identity(strict=True)
+        try:
+            return asyncio.run(BlueScanner(args).run())
+        except KeyboardInterrupt:
+            print("\nScan interrupted.")
+            audit_event("scan_interrupted")
+            return 130
+    finally:
+        close_audit_log()
 if __name__ == "__main__":
     raise SystemExit(main())
